@@ -53,6 +53,11 @@ class WebRequest(http.Request):
             self.server = self.channel.factory.server
             self.application_queue = None
             self._response_started = False
+            # Optional per-request deadline tracker (None when unconfigured)
+            self._deadline = None
+            # Ensures http.disconnect is delivered to the application at most
+            # once even if finish() and connectionLost() both run.
+            self._disconnect_sent = False
             self.server.protocol_connected(self)
         except Exception:
             logger.error(traceback.format_exc())
@@ -189,6 +194,12 @@ class WebRequest(http.Request):
                 if self.application_queue is None or self.content.closed:
                     # Not much we can do, the request is prematurely abandoned.
                     return
+                # Arm the optional per-request deadlines. The WebSocket branch
+                # above never reaches this point, so an upgraded connection
+                # cannot be hit by a stale HTTP timer.
+                self._deadline = self.server.deadline_manager.create(
+                    self, self.server.http_deadline_policy
+                )
                 # Run application against request
                 buffer_size = self.server.request_buffer_size
                 while True:
@@ -213,8 +224,8 @@ class WebRequest(http.Request):
         """
         Cleans up reply channel on close.
         """
-        if self.application_queue:
-            self.send_disconnect()
+        self._deadline_cancel()
+        self.send_disconnect()
         logger.debug("HTTP disconnect for %s", self.client_addr)
         http.Request.connectionLost(self, reason)
         self.server.protocol_disconnected(self)
@@ -223,8 +234,8 @@ class WebRequest(http.Request):
         """
         Cleans up reply channel on close.
         """
-        if self.application_queue:
-            self.send_disconnect()
+        self._deadline_cancel()
+        self.send_disconnect()
         logger.debug("HTTP close for %s", self.client_addr)
         http.Request.finish(self)
         self.server.protocol_disconnected(self)
@@ -260,14 +271,23 @@ class WebRequest(http.Request):
             logger.debug(
                 "HTTP %s response started for %s", message["status"], self.client_addr
             )
+            # response.start ends the first-response phase and opens the
+            # body-idle phase.
+            self._deadline_response_started()
         elif message["type"] == "http.response.body":
             if not self._response_started:
                 raise ValueError(
                     "HTTP response has not yet been started but got %s"
                     % message["type"]
                 )
-            # Write out body
-            http.Request.write(self, message.get("body", b""))
+            body = message.get("body", b"")
+            # Only non-empty bodies count as output progress; empty messages
+            # must not reset the idle deadline.
+            self._deadline_body(body)
+            # Write out body. This only enters Twisted's send buffer; it is
+            # not evidence of client-side drain, so the deadline policy does
+            # not treat it as transport progress.
+            http.Request.write(self, body)
             # End if there's no more content
             if not message.get("more_body", False):
                 self.finish()
@@ -323,6 +343,47 @@ class WebRequest(http.Request):
                     "Application failed to respond within time limit.",
                 )
 
+    ### Deadline policy hooks
+
+    def _deadline_response_started(self):
+        if self._deadline is not None:
+            self._deadline.note_response_started()
+
+    def _deadline_body(self, body):
+        if self._deadline is not None:
+            self._deadline.note_body(body)
+
+    def _deadline_cancel(self):
+        if self._deadline is not None:
+            self._deadline.cancel()
+            self._deadline = None
+
+    def _deadline_send_504(self):
+        """
+        Timeout action when no response header has been sent yet: emit a
+        legal 504 response instead of dropping the connection silently.
+        """
+        self.basic_error(
+            504,
+            b"Gateway Timeout",
+            "Application did not produce a response before the deadline.",
+        )
+
+    def _deadline_abort_transport(self):
+        """
+        Timeout action after the response has started: the current
+        transmission can only be terminated, a second status line would be
+        illegal.
+        """
+        transport = getattr(getattr(self, "channel", None), "transport", None)
+        abort = getattr(transport, "abortConnection", None)
+        if callable(abort):
+            # Hard abort: pending buffered data is discarded and the socket is
+            # closed without waiting for a graceful drain.
+            abort()
+        elif self.channel is not None:
+            self.channel.loseConnection()
+
     ### Utility functions
 
     def send_disconnect(self):
@@ -330,9 +391,13 @@ class WebRequest(http.Request):
         Sends a http.disconnect message.
         Useful only really for long-polling.
         """
+        # Deliver at most once even if finish() and connectionLost() both run.
+        if self._disconnect_sent:
+            return
         # If we don't yet have a path, then don't send as we never opened.
-        if self.path:
+        if self.application_queue and self.path:
             self.application_queue.put_nowait({"type": "http.disconnect"})
+            self._disconnect_sent = True
 
     def duration(self):
         """

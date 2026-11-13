@@ -37,6 +37,7 @@ from twisted.internet.endpoints import serverFromString
 from twisted.logger import STDLibLogObserver, globalLogBeginner
 from twisted.web import http
 
+from .deadline import DeadlineManager, HTTPDeadlinePolicy, MonotonicClock
 from .http_protocol import HTTPFactory
 from .ws_protocol import WebSocketFactory
 
@@ -51,6 +52,7 @@ class Server:
         signal_handlers=True,
         action_logger=None,
         http_timeout=None,
+        http_deadline_policy=None,
         request_buffer_size=8192,
         websocket_timeout=86400,
         websocket_connect_timeout=20,
@@ -75,6 +77,9 @@ class Server:
         self.signal_handlers = signal_handlers
         self.action_logger = action_logger
         self.http_timeout = http_timeout
+        # Optional independent per-request deadlines; None preserves the
+        # legacy behaviour exactly.
+        self.http_deadline_policy = HTTPDeadlinePolicy.create(http_deadline_policy)
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.request_buffer_size = request_buffer_size
@@ -100,6 +105,10 @@ class Server:
     def run(self):
         # A dict of protocol: {"application_instance":, "connected":, "disconnected":} dicts
         self.connections = {}
+        # Registry of per-request HTTP deadline trackers (empty unless an
+        # HTTPDeadlinePolicy is configured). Uses monotonic time while still
+        # scheduling on the running reactor.
+        self.deadline_manager = DeadlineManager(clock=MonotonicClock(reactor))
         # Make the factory
         self.http_factory = HTTPFactory(self)
         self.ws_factory = WebSocketFactory(self, server=self.server_name)
@@ -317,6 +326,9 @@ class Server:
         """
         Kills all application coroutines before reactor exit.
         """
+        # Release every per-request HTTP deadline so no timer outlives the
+        # server or fires against a connection that is being torn down.
+        self.deadline_manager.cancel_all()
         # Send cancel to all coroutines
         wait_for = []
         for details in self.connections.values():

@@ -6,6 +6,7 @@ from argparse import ArgumentError, Namespace
 from asgiref.compatibility import guarantee_single_callable
 
 from .access import AccessLogGenerator
+from .deadline import HTTPDeadlinePolicy
 from .endpoints import build_endpoint_description_strings
 from .server import Server
 from .utils import import_by_path
@@ -83,6 +84,38 @@ class CommandLineInterface:
             "--http-timeout",
             type=int,
             help="How long to wait for worker before timing out HTTP connections",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--http-deadline-first-response",
+            type=float,
+            dest="http_deadline_first_response",
+            help=(
+                "Per-request deadline in seconds: maximum wait for the first "
+                "http.response.start. Optional; leaves the default behaviour "
+                "unchanged when omitted."
+            ),
+            default=None,
+        )
+        self.parser.add_argument(
+            "--http-deadline-body-idle",
+            type=float,
+            dest="http_deadline_body_idle",
+            help=(
+                "Per-request deadline in seconds: maximum idle gap between "
+                "non-empty response body chunks. Empty body messages never "
+                "reset this timer."
+            ),
+            default=None,
+        )
+        self.parser.add_argument(
+            "--http-deadline-total",
+            type=float,
+            dest="http_deadline_total",
+            help=(
+                "Per-request deadline in seconds: maximum total duration of a "
+                "single request, never reset by progress."
+            ),
             default=None,
         )
         self.parser.add_argument(
@@ -280,12 +313,29 @@ class CommandLineInterface:
             file_descriptor=args.file_descriptor,
         )
         endpoints = sorted(args.socket_strings + endpoints)
+        # Build the optional per-request HTTP deadline policy. It is only
+        # created when at least one of the three limits was requested, so
+        # deployments that use neither keep the legacy behaviour exactly.
+        http_deadline_policy = None
+        if any(
+            (
+                args.http_deadline_first_response,
+                args.http_deadline_body_idle,
+                args.http_deadline_total,
+            )
+        ):
+            http_deadline_policy = HTTPDeadlinePolicy(
+                first_response_timeout=args.http_deadline_first_response,
+                body_idle_timeout=args.http_deadline_body_idle,
+                total_timeout=args.http_deadline_total,
+            )
         # Start the server
         logger.info("Starting server at {}".format(", ".join(endpoints)))
         self.server = self.server_class(
             application=application,
             endpoints=endpoints,
             http_timeout=args.http_timeout,
+            http_deadline_policy=http_deadline_policy,
             ping_interval=args.ping_interval,
             ping_timeout=args.ping_timeout,
             websocket_timeout=args.websocket_timeout,

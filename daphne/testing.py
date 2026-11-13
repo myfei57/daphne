@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import multiprocessing
 import os
@@ -21,6 +22,7 @@ class BaseDaphneTestingInstance:
         self,
         xff=False,
         http_timeout=None,
+        http_deadline_policy=None,
         request_buffer_size=None,
         websocket_max_message_size=None,
         websocket_max_frame_size=None,
@@ -29,6 +31,7 @@ class BaseDaphneTestingInstance:
     ):
         self.xff = xff
         self.http_timeout = http_timeout
+        self.http_deadline_policy = http_deadline_policy
         self.host = "127.0.0.1"
         self.request_buffer_size = request_buffer_size
         self.websocket_max_message_size = websocket_max_message_size
@@ -50,6 +53,8 @@ class BaseDaphneTestingInstance:
             kwargs["proxy_forwarded_proto_header"] = "X-Forwarded-Proto"
         if self.http_timeout:
             kwargs["http_timeout"] = self.http_timeout
+        if self.http_deadline_policy is not None:
+            kwargs["http_deadline_policy"] = self.http_deadline_policy
         if self.websocket_max_message_size is not None:
             kwargs["websocket_max_message_size"] = self.websocket_max_message_size
         if self.websocket_max_frame_size is not None:
@@ -303,6 +308,74 @@ class TestApplication:
             os.unlink(cls.result_storage)
         except OSError:
             pass
+
+
+class SlowStartApplication:
+    """
+    Test application that accepts a request and never sends
+    ``http.response.start``, used to exercise first-response deadlines.
+    """
+
+    async def __call__(self, scope, receive, send):
+        await receive()
+        await asyncio.sleep(3600)
+
+
+class SlowBodyApplication:
+    """
+    Test application that starts a response and sends one non-empty chunk,
+    then goes silent without finishing, used to exercise body-idle deadlines
+    after the response has already started.
+    """
+
+    async def __call__(self, scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200})
+        await send(
+            {"type": "http.response.body", "body": b"partial", "more_body": True}
+        )
+        await asyncio.sleep(3600)
+
+
+class EmptyChatterApplication:
+    """
+    Test application that starts a response and then only emits empty body
+    messages. Empty messages must never reset the body-idle deadline.
+    """
+
+    async def __call__(self, scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200})
+        while True:
+            await send(
+                {"type": "http.response.body", "body": b"", "more_body": True}
+            )
+            await asyncio.sleep(0.05)
+
+
+class HealthyStreamApplication:
+    """
+    Test application that streams a bounded sequence of non-empty chunks with
+    small gaps and then finishes normally. Used to verify that real byte-level
+    progress keeps a request alive and that pipelined requests complete.
+    """
+
+    chunk_count = 5
+    chunk_interval = 0.05
+
+    async def __call__(self, scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200})
+        for index in range(self.chunk_count):
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"chunk%d" % index,
+                    "more_body": True,
+                }
+            )
+            await asyncio.sleep(self.chunk_interval)
+        await send({"type": "http.response.body", "body": b"done"})
 
 
 def _reinstall_reactor():

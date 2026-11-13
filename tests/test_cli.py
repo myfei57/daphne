@@ -4,6 +4,7 @@ from argparse import ArgumentError
 from unittest import TestCase, skipUnless
 
 from daphne.cli import CommandLineInterface
+from daphne.deadline import HTTPDeadlinePolicy
 from daphne.endpoints import build_endpoint_description_strings as build
 
 
@@ -258,6 +259,38 @@ class TestCLIInterface(TestCase):
         Passing `--no-server-name` will set server name to '' (empty string)
         """
         self.assertCLI(["--no-server-name"], {"server_name": ""})
+
+    def test_no_deadline_policy_by_default(self):
+        """
+        Without deadline arguments no policy is passed to the server, so the
+        legacy behaviour is unchanged.
+        """
+        self.assertCLI([], {"http_deadline_policy": None})
+
+    def test_http_deadline_arguments_build_policy(self):
+        self.assertCLI(
+            [
+                "--http-deadline-first-response",
+                "1.5",
+                "--http-deadline-body-idle",
+                "2",
+                "--http-deadline-total",
+                "10",
+            ],
+            {
+                "http_deadline_policy": HTTPDeadlinePolicy(
+                    first_response_timeout=1.5,
+                    body_idle_timeout=2.0,
+                    total_timeout=10.0,
+                )
+            },
+        )
+
+    def test_partial_http_deadline_arguments_build_policy(self):
+        self.assertCLI(
+            ["--http-deadline-total", "3"],
+            {"http_deadline_policy": HTTPDeadlinePolicy(total_timeout=3.0)},
+        )
 
 
 @skipUnless(os.getenv("ASGI_THREADS"), "ASGI_THREADS environment variable not set.")

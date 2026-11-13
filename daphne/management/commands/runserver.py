@@ -11,6 +11,7 @@ from django.core.management import CommandError
 from django.core.management.commands.runserver import Command as RunserverCommand
 
 from daphne import __version__
+from daphne.deadline import HTTPDeadlinePolicy
 from daphne.endpoints import build_endpoint_description_strings
 from daphne.server import Server
 
@@ -63,6 +64,39 @@ class Command(RunserverCommand):
             ),
         )
         parser.add_argument(
+            "--http_deadline_first_response",
+            action="store",
+            dest="http_deadline_first_response",
+            type=float,
+            default=None,
+            help=(
+                "Per-request deadline in seconds for the first "
+                "http.response.start (default: no deadline)"
+            ),
+        )
+        parser.add_argument(
+            "--http_deadline_body_idle",
+            action="store",
+            dest="http_deadline_body_idle",
+            type=float,
+            default=None,
+            help=(
+                "Per-request deadline in seconds for the idle gap between "
+                "non-empty response body chunks (default: no deadline)"
+            ),
+        )
+        parser.add_argument(
+            "--http_deadline_total",
+            action="store",
+            dest="http_deadline_total",
+            type=float,
+            default=None,
+            help=(
+                "Per-request deadline in seconds for the total request "
+                "duration (default: no deadline)"
+            ),
+        )
+        parser.add_argument(
             "--websocket_handshake_timeout",
             action="store",
             dest="websocket_handshake_timeout",
@@ -105,6 +139,19 @@ class Command(RunserverCommand):
 
     def handle(self, *args, **options):
         self.http_timeout = options.get("http_timeout", None)
+        deadline_values = (
+            options.get("http_deadline_first_response"),
+            options.get("http_deadline_body_idle"),
+            options.get("http_deadline_total"),
+        )
+        if any(deadline_values):
+            self.http_deadline_policy = HTTPDeadlinePolicy(
+                first_response_timeout=deadline_values[0],
+                body_idle_timeout=deadline_values[1],
+                total_timeout=deadline_values[2],
+            )
+        else:
+            self.http_deadline_policy = None
         self.websocket_handshake_timeout = options.get("websocket_handshake_timeout", 5)
         # Check Channels is installed right
         if options["use_asgi"] and not hasattr(settings, "ASGI_APPLICATION"):
@@ -170,6 +217,7 @@ class Command(RunserverCommand):
                 signal_handlers=not options["use_reloader"],
                 action_logger=self.log_action,
                 http_timeout=self.http_timeout,
+                http_deadline_policy=self.http_deadline_policy,
                 root_path=getattr(settings, "FORCE_SCRIPT_NAME", "") or "",
                 websocket_handshake_timeout=self.websocket_handshake_timeout,
                 websocket_max_message_size=self.websocket_max_message_size,
