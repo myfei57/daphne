@@ -2,6 +2,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import re
 import tempfile
 import traceback
 from concurrent.futures import CancelledError
@@ -24,6 +25,9 @@ class BaseDaphneTestingInstance:
         request_buffer_size=None,
         websocket_max_message_size=None,
         websocket_max_frame_size=None,
+        server_certfile=None,
+        server_keyfile=None,
+        client_cafile=None,
         *,
         application,
     ):
@@ -33,6 +37,12 @@ class BaseDaphneTestingInstance:
         self.request_buffer_size = request_buffer_size
         self.websocket_max_message_size = websocket_max_message_size
         self.websocket_max_frame_size = websocket_max_frame_size
+        # When server_certfile is set the child process serves TLS using the
+        # PEM files on disk.  client_cafile additionally requires and verifies
+        # a client certificate (mutual TLS).
+        self.server_certfile = server_certfile
+        self.server_keyfile = server_keyfile
+        self.client_cafile = client_cafile
         self.application = application
 
     def get_application(self):
@@ -61,6 +71,9 @@ class BaseDaphneTestingInstance:
             kwargs=kwargs,
             setup=self.process_setup,
             teardown=self.process_teardown,
+            server_certfile=self.server_certfile,
+            server_keyfile=self.server_keyfile,
+            client_cafile=self.client_cafile,
         )
         self.process.start()
         # Wait for the port
@@ -133,6 +146,83 @@ class DaphneTestingInstance(BaseDaphneTestingInstance):
         TestApplication.save_setup(response_messages=messages)
 
 
+class ScopeRecorderApplication:
+    """
+    ASGI application that persists every connection scope into its own
+    pickle file (one per request path) instead of a single shared slot.
+
+    This makes it possible to inspect the independent, immutable scopes of
+    several concurrent or keep-alive connections, which the single-slot
+    :class:`TestApplication` storage cannot keep apart.  Only the scope is
+    recorded; the application replies with a minimal successful HTTP or
+    WebSocket response.
+    """
+
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    @staticmethod
+    def _key_for_path(path):
+        # Turn a path such as "/conn/3" into a safe file name component.
+        return re.sub(r"[^A-Za-z0-9_.-]", "_", path.strip("/")) or "root"
+
+    def _record(self, scope):
+        key = self._key_for_path(scope["path"])
+        with open(os.path.join(self.output_dir, "scope-%s.pkl" % key), "wb") as fh:
+            pickle.dump(scope, fh)
+
+    async def __call__(self, scope, receive, send):
+        self._record(scope)
+        if scope["type"] == "http":
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/plain")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b"OK"})
+            # Stay alive until Daphne signals the end of the request.
+            while True:
+                if (await receive())["type"] == "http.disconnect":
+                    break
+        else:
+            # Complete the WebSocket handshake then wait for disconnect.
+            await receive()
+            await send({"type": "websocket.accept"})
+            while True:
+                if (await receive())["type"] == "websocket.disconnect":
+                    break
+
+
+class ScopeRecorderTestingInstance(BaseDaphneTestingInstance):
+    """
+    Testing instance backed by :class:`ScopeRecorderApplication`.
+
+    Each connection scope is written separately under ``output_dir`` and can
+    be read back with :meth:`get_scope`.  All constructor keyword arguments
+    supported by :class:`BaseDaphneTestingInstance` (including the TLS PEM
+    file options) are passed through.
+    """
+
+    def __init__(self, output_dir, *args, **kwargs):
+        self.output_dir = output_dir
+        super().__init__(
+            *args, application=ScopeRecorderApplication(output_dir), **kwargs
+        )
+
+    def scope_path(self, path):
+        key = ScopeRecorderApplication._key_for_path(path)
+        return os.path.join(self.output_dir, "scope-%s.pkl" % key)
+
+    def get_scope(self, path):
+        with open(self.scope_path(path), "rb") as fh:
+            return pickle.load(fh)
+
+    def has_scope(self, path):
+        return os.path.exists(self.scope_path(path))
+
+
 class DaphneProcess(multiprocessing.Process):
     """
     Process subclass that launches and runs a Daphne instance, communicating the
@@ -140,7 +230,16 @@ class DaphneProcess(multiprocessing.Process):
     """
 
     def __init__(
-        self, host, get_application, kwargs=None, setup=None, teardown=None, port=None
+        self,
+        host,
+        get_application,
+        kwargs=None,
+        setup=None,
+        teardown=None,
+        port=None,
+        server_certfile=None,
+        server_keyfile=None,
+        client_cafile=None,
     ):
         super().__init__()
         self.host = host
@@ -151,6 +250,44 @@ class DaphneProcess(multiprocessing.Process):
         self.port = multiprocessing.Value("i", port if port is not None else 0)
         self.ready = multiprocessing.Event()
         self.errors = multiprocessing.Queue()
+        self.server_certfile = server_certfile
+        self.server_keyfile = server_keyfile
+        self.client_cafile = client_cafile
+
+    def _build_tls_endpoint(self, reactor):
+        """
+        Build a programmatic TLS server endpoint from PEM files on disk.
+
+        When ``client_cafile`` is provided the endpoint requires and verifies
+        a client certificate against that CA (mutual TLS); otherwise the
+        server presents its own certificate but does not request one.
+        """
+        from twisted.internet import ssl as tssl
+        from twisted.internet.endpoints import SSL4ServerEndpoint
+
+        with open(self.server_certfile, "rb") as cert_fh:
+            cert_pem = cert_fh.read()
+        with open(self.server_keyfile, "rb") as key_fh:
+            key_pem = key_fh.read()
+        private_certificate = tssl.PrivateCertificate.loadPEM(
+            cert_pem + b"\n" + key_pem
+        )
+        options_kwargs = {
+            "privateKey": private_certificate.privateKey.original,
+            "certificate": private_certificate.original,
+        }
+        if self.client_cafile is not None:
+            # Specifying trustRoot both requires a client certificate and
+            # verifies it against the given CA during the handshake.
+            with open(self.client_cafile, "rb") as ca_fh:
+                options_kwargs["trustRoot"] = tssl.Certificate.loadPEM(ca_fh.read())
+        context_factory = tssl.CertificateOptions(**options_kwargs)
+        return SSL4ServerEndpoint(
+            reactor,
+            self.port.value,
+            context_factory,
+            interface=self.host,
+        )
 
     def run(self):
         # OK, now we are in a forked child process, and want to use the reactor.
@@ -168,9 +305,13 @@ class DaphneProcess(multiprocessing.Process):
 
         try:
             # Create the server class
-            endpoints = build_endpoint_description_strings(
-                host=self.host, port=self.port.value
-            )
+            if self.server_certfile is not None:
+                # TLS (optionally mutual TLS) via a programmatic endpoint.
+                endpoints = [self._build_tls_endpoint(reactor)]
+            else:
+                endpoints = build_endpoint_description_strings(
+                    host=self.host, port=self.port.value
+                )
             self.server = Server(
                 application=application,
                 endpoints=endpoints,

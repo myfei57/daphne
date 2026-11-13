@@ -34,6 +34,7 @@ from functools import partial
 
 from twisted.internet import defer, reactor
 from twisted.internet.endpoints import serverFromString
+from twisted.internet.interfaces import IStreamServerEndpoint
 from twisted.logger import STDLibLogObserver, globalLogBeginner
 from twisted.web import http
 
@@ -131,9 +132,21 @@ class Server:
         reactor.callLater(2, self.timeout_checker)
 
         for socket_description in self.endpoints:
-            logger.info("Configuring endpoint %s", socket_description)
-            ep = serverFromString(reactor, str(socket_description))
-            listener = ep.listen(self.http_factory)
+            if isinstance(socket_description, str):
+                logger.info("Configuring endpoint %s", socket_description)
+                endpoint = serverFromString(reactor, socket_description)
+            else:
+                # A pre-built endpoint object (e.g. an SSL4ServerEndpoint
+                # configured programmatically for TLS/mTLS) can be supplied
+                # directly instead of a description string.
+                logger.info("Configuring endpoint object %r", socket_description)
+                endpoint = socket_description
+                if not IStreamServerEndpoint.providedBy(endpoint):
+                    raise TypeError(
+                        "Endpoint %r does not provide IStreamServerEndpoint"
+                        % (endpoint,)
+                    )
+            listener = endpoint.listen(self.http_factory)
             listener.addCallback(self.listen_success)
             listener.addErrback(self.listen_error)
             self.listeners.append(listener)

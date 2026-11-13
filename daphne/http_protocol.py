@@ -9,6 +9,7 @@ from twisted.protocols.policies import ProtocolWrapper
 from twisted.web import http
 from zope.interface import implementer
 
+from .tls import build_tls_extension
 from .utils import HEADER_NAME_RE, INVALID_HEADER_VALUE_BYTES, parse_x_forwarded_for
 
 logger = logging.getLogger(__name__)
@@ -164,26 +165,34 @@ class WebRequest(http.Request):
                             self.clean_headers.append((name.lower(), value))
                 logger.debug("HTTP %s request for %s", self.method, self.client_addr)
                 self.content.seek(0, 0)
+                # Build the application scope. The TLS extension is derived
+                # from the real transport only: a proxy header such as
+                # X-Forwarded-Proto can change ``client_scheme`` but never
+                # fabricates TLS evidence on a plaintext connection.
+                scope = {
+                    "type": "http",
+                    # TODO: Correctly say if it's 1.1 or 1.0
+                    "http_version": self.clientproto.split(b"/")[-1].decode(
+                        "ascii"
+                    ),
+                    "method": self.method.decode("ascii"),
+                    "path": unquote(self.path.decode("ascii")),
+                    "raw_path": self.path,
+                    "root_path": self.root_path,
+                    "scheme": self.client_scheme,
+                    "query_string": self.query_string,
+                    "headers": self.clean_headers,
+                    "client": self.client_addr,
+                    "server": self.server_addr,
+                }
+                tls_extension = build_tls_extension(self.transport)
+                if tls_extension is not None:
+                    scope["extensions"] = {"tls": tls_extension}
                 # Work out the application scope and create application
                 self.application_queue = yield maybeDeferred(
                     self.server.create_application,
                     self,
-                    {
-                        "type": "http",
-                        # TODO: Correctly say if it's 1.1 or 1.0
-                        "http_version": self.clientproto.split(b"/")[-1].decode(
-                            "ascii"
-                        ),
-                        "method": self.method.decode("ascii"),
-                        "path": unquote(self.path.decode("ascii")),
-                        "raw_path": self.path,
-                        "root_path": self.root_path,
-                        "scheme": self.client_scheme,
-                        "query_string": self.query_string,
-                        "headers": self.clean_headers,
-                        "client": self.client_addr,
-                        "server": self.server_addr,
-                    },
+                    scope,
                 )
                 # Check they didn't close an unfinished request
                 if self.application_queue is None or self.content.closed:

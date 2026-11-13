@@ -10,6 +10,7 @@ from autobahn.twisted.websocket import (
 )
 from twisted.internet import defer
 
+from .tls import build_tls_extension
 from .utils import parse_x_forwarded_for
 
 logger = logging.getLogger(__name__)
@@ -73,20 +74,28 @@ class WebSocketProtocol(WebSocketServerProtocol):
                     ]
             # Make new application instance with scope
             self.path = request.path.encode("ascii")
+            scope = {
+                "type": "websocket",
+                "path": unquote(self.path.decode("ascii")),
+                "raw_path": self.path,
+                "root_path": self.root_path,
+                "headers": self.clean_headers,
+                "query_string": self._raw_query_string,  # Passed by HTTP protocol
+                "client": self.client_addr,
+                "server": self.server_addr,
+                "subprotocols": subprotocols,
+            }
+            # The HTTP upgrade hands this protocol the very same TLS wrapper
+            # transport, so the connection's TLS evidence is preserved.  It is
+            # re-extracted into fresh immutable PEM strings for this scope and
+            # never shared as a mutable object.
+            tls_extension = build_tls_extension(self.transport)
+            if tls_extension is not None:
+                scope["extensions"] = {"tls": tls_extension}
             self.application_deferred = defer.maybeDeferred(
                 self.server.create_application,
                 self,
-                {
-                    "type": "websocket",
-                    "path": unquote(self.path.decode("ascii")),
-                    "raw_path": self.path,
-                    "root_path": self.root_path,
-                    "headers": self.clean_headers,
-                    "query_string": self._raw_query_string,  # Passed by HTTP protocol
-                    "client": self.client_addr,
-                    "server": self.server_addr,
-                    "subprotocols": subprotocols,
-                },
+                scope,
             )
             if self.application_deferred is not None:
                 self.application_deferred.addCallback(self.applicationCreateWorked)
