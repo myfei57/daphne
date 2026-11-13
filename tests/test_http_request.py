@@ -31,7 +31,13 @@ class TestHTTPRequest(DaphneTestCase):
                 "query_string",
                 "headers",
             },
-            optional_keys={"scheme", "root_path", "client", "server"},
+            optional_keys={
+                "scheme",
+                "root_path",
+                "client",
+                "server",
+                "extensions",
+            },
             actual_keys=scope.keys(),
         )
         self.assertEqual(scope["asgi"]["version"], "3.0")

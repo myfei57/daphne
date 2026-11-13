@@ -3,13 +3,21 @@ import time
 import traceback
 from urllib.parse import unquote
 
-from twisted.internet.defer import inlineCallbacks, maybeDeferred
+from twisted.internet.defer import inlineCallbacks, maybeDeferred, succeed
 from twisted.internet.interfaces import IProtocolNegotiationFactory
 from twisted.protocols.policies import ProtocolWrapper
 from twisted.web import http
 from zope.interface import implementer
 
 from .utils import HEADER_NAME_RE, INVALID_HEADER_VALUE_BYTES, parse_x_forwarded_for
+from . import zerocopy
+from .zerocopy import (
+    ZEROCOPY_EXTENSION,
+    ZeroCopyFileProducer,
+    fragment_length,
+    validate_zerocopy_message,
+    zerocopy_capable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,25 +173,32 @@ class WebRequest(http.Request):
                 logger.debug("HTTP %s request for %s", self.method, self.client_addr)
                 self.content.seek(0, 0)
                 # Work out the application scope and create application
+                scope = {
+                    "type": "http",
+                    # TODO: Correctly say if it's 1.1 or 1.0
+                    "http_version": self.clientproto.split(b"/")[-1].decode(
+                        "ascii"
+                    ),
+                    "method": self.method.decode("ascii"),
+                    "path": unquote(self.path.decode("ascii")),
+                    "raw_path": self.path,
+                    "root_path": self.root_path,
+                    "scheme": self.client_scheme,
+                    "query_string": self.query_string,
+                    "headers": self.clean_headers,
+                    "client": self.client_addr,
+                    "server": self.server_addr,
+                }
+                # Only advertise zero copy send on transports that can
+                # actually perform a kernel sendfile (plaintext sockets on
+                # platforms with os.sendfile; never TLS/HTTP2/Windows).
+                extensions = self.zerocopy_extensions()
+                if extensions:
+                    scope["extensions"] = extensions
                 self.application_queue = yield maybeDeferred(
                     self.server.create_application,
                     self,
-                    {
-                        "type": "http",
-                        # TODO: Correctly say if it's 1.1 or 1.0
-                        "http_version": self.clientproto.split(b"/")[-1].decode(
-                            "ascii"
-                        ),
-                        "method": self.method.decode("ascii"),
-                        "path": unquote(self.path.decode("ascii")),
-                        "raw_path": self.path,
-                        "root_path": self.root_path,
-                        "scheme": self.client_scheme,
-                        "query_string": self.query_string,
-                        "headers": self.clean_headers,
-                        "client": self.client_addr,
-                        "server": self.server_addr,
-                    },
+                    scope,
                 )
                 # Check they didn't close an unfinished request
                 if self.application_queue is None or self.content.closed:
@@ -270,36 +285,150 @@ class WebRequest(http.Request):
             http.Request.write(self, message.get("body", b""))
             # End if there's no more content
             if not message.get("more_body", False):
-                self.finish()
-                logger.debug("HTTP response complete for %s", self.client_addr)
-                try:
-                    uri = self.uri.decode("ascii")
-                except UnicodeDecodeError:
-                    # The path is malformed somehow - do our best to log something
-                    uri = repr(self.uri)
-                try:
-                    self.server.log_action(
-                        "http",
-                        "complete",
-                        {
-                            "path": uri,
-                            "status": self.code,
-                            "method": self.method.decode("ascii", "replace"),
-                            "client": (
-                                "%s:%s" % tuple(self.client_addr)
-                                if self.client_addr
-                                else None
-                            ),
-                            "time_taken": self.duration(),
-                            "size": self.sentLength,
-                        },
-                    )
-                except Exception:
-                    logger.error(traceback.format_exc())
+                self._complete_response()
             else:
                 logger.debug("HTTP response chunk for %s", self.client_addr)
+        elif message["type"] == ZEROCOPY_EXTENSION:
+            if not self._response_started:
+                raise ValueError(
+                    "HTTP response has not yet been started but got %s"
+                    % message["type"]
+                )
+            return self.handle_zerocopysend(message)
         else:
             raise ValueError("Cannot handle message type %s!" % message["type"])
+
+    def handle_zerocopysend(self, message):
+        """
+        Handle an ``http.response.zerocopysend`` message.
+
+        Returns a Deferred that fires once the whole file fragment has
+        been transferred (or the transfer fails), so the ASGI ``send``
+        awaitable does not return before ordering against subsequent
+        body messages is guaranteed.  All argument validation happens
+        before any response byte is written.
+        """
+        # Never fake zero copy: refuse if this transport cannot do a
+        # real kernel sendfile (TLS, HTTP/2, platform without os.sendfile).
+        if not zerocopy_capable(self.transport):
+            raise ValueError(
+                "http.response.zerocopysend is not available on this "
+                "connection; it requires a plaintext socket transport with "
+                "kernel sendfile support"
+            )
+        (
+            file_obj,
+            in_fd,
+            offset,
+            count,
+            stat_result,
+        ) = validate_zerocopy_message(message)
+        more_body = message.get("more_body", False)
+        # HEAD requests and 204/304 responses must never carry a body.
+        # Mirror Twisted's own Request.write no-op behaviour.
+        if self.method == b"HEAD" or self.code in http.NO_BODY_CODES:
+            if not more_body:
+                self._complete_response()
+            return succeed(None)
+        # Make sure response headers are on the wire and the framing
+        # mode (Content-Length vs chunked) is decided.
+        if not self.startedWriting:
+            http.Request.write(self, b"")
+        if self._disconnected:
+            raise RuntimeError("Cannot send zerocopy body on a lost connection")
+        planned = fragment_length(in_fd, offset, count, stat_result)
+        # Enforce Content-Length: never emit more bytes than advertised.
+        content_length = self.responseHeaders.getRawHeaders(b"Content-Length")
+        if content_length is not None and planned is not None:
+            try:
+                allowed = int(content_length[0])
+            except ValueError:
+                allowed = None
+            if allowed is not None and self.sentLength + planned > allowed:
+                raise ValueError(
+                    "http.response.zerocopysend of %d bytes would exceed the "
+                    "Content-Length of %d bytes (%d already sent)"
+                    % (planned, allowed, self.sentLength)
+                )
+        # Under chunked transfer encoding the raw sendfile bytes need
+        # their own chunk framing.  One chunk covers the whole fragment;
+        # its length is known because fragment_length is required here.
+        if self.chunked:
+            if planned is None:
+                raise ValueError(
+                    "http.response.zerocopysend without 'count' on a non "
+                    "regular file cannot be framed for a chunked response; "
+                    "set a Content-Length or an explicit count"
+                )
+            if planned:
+                self.channel.write(b"%X\r\n" % planned)
+        out_fd = self.transport.getHandle().fileno()
+        producer = ZeroCopyFileProducer(
+            request=self,
+            file_obj=file_obj,
+            in_fd=in_fd,
+            out_fd=out_fd,
+            offset=offset,
+            count=count,
+            stat_result=stat_result,
+            backend=zerocopy.kernel_sendfile,
+            chunked=self.chunked,
+        )
+        # A pull producer: Twisted drives it cooperatively, applying
+        # backpressure instead of blocking the reactor.
+        self.registerProducer(producer, False)
+
+        def _finished(result):
+            if not more_body:
+                self._complete_response()
+            return result
+
+        return producer.completion.addCallback(_finished)
+
+    def _complete_response(self):
+        """
+        Finish the response and emit the access log entry. Shared by the
+        ordinary body path and zerocopysend completion.
+        """
+        self.finish()
+        logger.debug("HTTP response complete for %s", self.client_addr)
+        try:
+            uri = self.uri.decode("ascii")
+        except UnicodeDecodeError:
+            # The path is malformed somehow - do our best to log something
+            uri = repr(self.uri)
+        try:
+            self.server.log_action(
+                "http",
+                "complete",
+                {
+                    "path": uri,
+                    "status": self.code,
+                    "method": self.method.decode("ascii", "replace"),
+                    "client": (
+                        "%s:%s" % tuple(self.client_addr)
+                        if self.client_addr
+                        else None
+                    ),
+                    "time_taken": self.duration(),
+                    "size": self.sentLength,
+                },
+            )
+        except Exception:
+            logger.error(traceback.format_exc())
+
+    def zerocopy_extensions(self):
+        """
+        Return the ASGI extensions scope entries supported on this
+        request's transport.  Empty unless a real kernel sendfile can be
+        issued on a plaintext socket.
+        """
+        try:
+            if zerocopy_capable(self.transport):
+                return {ZEROCOPY_EXTENSION: {}}
+        except Exception:
+            logger.debug("zerocopy capability check failed", exc_info=True)
+        return {}
 
     def handle_exception(self, exception):
         """

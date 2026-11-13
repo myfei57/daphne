@@ -242,8 +242,14 @@ class Server:
             # Ensure to send SOME reply.
             protocol.basic_error(500, b"Server Error", "Server Error")
             raise
-        # Let the protocol handle it
-        protocol.handle_reply(message)
+        # Let the protocol handle it.  A Deferred is returned for
+        # asynchronous replies such as http.response.zerocopysend: the
+        # ASGI send() call must not return until the transfer has
+        # completed (or definitively failed), so bridge it onto the
+        # asyncio event loop here.
+        result = protocol.handle_reply(message)
+        if isinstance(result, defer.Deferred):
+            await result.asFuture(asyncio.get_event_loop())
 
     @staticmethod
     def check_headers_type(message):
