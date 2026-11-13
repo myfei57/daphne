@@ -3,12 +3,17 @@ import time
 import traceback
 from urllib.parse import unquote
 
-from twisted.internet.defer import inlineCallbacks, maybeDeferred
+from twisted.internet.defer import (
+    CancelledError,
+    inlineCallbacks,
+    maybeDeferred,
+)
 from twisted.internet.interfaces import IProtocolNegotiationFactory
 from twisted.protocols.policies import ProtocolWrapper
 from twisted.web import http
 from zope.interface import implementer
 
+from .admission import AdmissionRejected, KIND_HTTP
 from .utils import HEADER_NAME_RE, INVALID_HEADER_VALUE_BYTES, parse_x_forwarded_for
 
 logger = logging.getLogger(__name__)
@@ -53,6 +58,9 @@ class WebRequest(http.Request):
             self.server = self.channel.factory.server
             self.application_queue = None
             self._response_started = False
+            # Set while the admission gate coroutine is queued/running, so a
+            # client disconnect can cancel the wait instead of leaking it.
+            self._admission_deferred = None
             self.server.protocol_connected(self)
         except Exception:
             logger.error(traceback.format_exc())
@@ -164,6 +172,44 @@ class WebRequest(http.Request):
                             self.clean_headers.append((name.lower(), value))
                 logger.debug("HTTP %s request for %s", self.method, self.client_addr)
                 self.content.seek(0, 0)
+
+                # Admission gate, before any application instance is made.
+                # Rejection is a plain, legal HTTP 503 - the response has not
+                # started, so there is no half-sent state to clean up.
+                ticket = None
+                if self.server.admission is not None:
+                    self._admission_deferred = self.server.admission_deferred(
+                        self.server.admission.admit(KIND_HTTP)
+                    )
+                    try:
+                        ticket = yield self._admission_deferred
+                    except AdmissionRejected as exc:
+                        self._admission_deferred = None
+                        logger.info(
+                            "HTTP request rejected by admission controller: %s",
+                            exc.reason.value,
+                        )
+                        self.setHeader(
+                            b"Retry-After",
+                            str(
+                                self.server.admission.config.retry_after
+                            ).encode("ascii"),
+                        )
+                        self.basic_error(
+                            503,
+                            b"Service Unavailable",
+                            "Server is at capacity and cannot handle this request.",
+                        )
+                        return
+                    except CancelledError:
+                        # The connection went away while queued. The
+                        # controller's finally block already removed the
+                        # waiter, so nothing is left to bookkeep.
+                        self._admission_deferred = None
+                        return
+                    self._admission_deferred = None
+                    self.server.attach_admission_ticket(self, ticket)
+
                 # Work out the application scope and create application
                 self.application_queue = yield maybeDeferred(
                     self.server.create_application,
@@ -188,6 +234,8 @@ class WebRequest(http.Request):
                 # Check they didn't close an unfinished request
                 if self.application_queue is None or self.content.closed:
                     # Not much we can do, the request is prematurely abandoned.
+                    if ticket is not None:
+                        self.server.release_admission_ticket(self)
                     return
                 # Run application against request
                 buffer_size = self.server.request_buffer_size
@@ -213,6 +261,11 @@ class WebRequest(http.Request):
         """
         Cleans up reply channel on close.
         """
+        # If the client drops while we are still waiting for admission,
+        # cancel the bridge Deferred so the queued waiter is removed.
+        if self._admission_deferred is not None:
+            self._admission_deferred.cancel()
+            self._admission_deferred = None
         if self.application_queue:
             self.send_disconnect()
         logger.debug("HTTP disconnect for %s", self.client_addr)

@@ -6,6 +6,7 @@ from argparse import ArgumentError, Namespace
 from asgiref.compatibility import guarantee_single_callable
 
 from .access import AccessLogGenerator
+from .admission import AdmissionConfig, POLICY_REJECT, POLICY_WAIT
 from .endpoints import build_endpoint_description_strings
 from .server import Server
 from .utils import import_by_path
@@ -176,6 +177,61 @@ class CommandLineInterface:
         self.parser.add_argument(
             "--no-server-name", dest="server_name", action="store_const", const=""
         )
+        self.parser.add_argument(
+            "--admission-http-capacity",
+            type=int,
+            dest="admission_http_capacity",
+            help="Maximum in-flight HTTP capacity (network + task shares). "
+            "Unset disables the HTTP admission limit.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-websocket-pending-capacity",
+            type=int,
+            dest="admission_websocket_pending_capacity",
+            help="Maximum number of WebSocket connections waiting for an "
+            "application accept (pre-handshake). Unset disables the limit.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-websocket-active-capacity",
+            type=int,
+            dest="admission_websocket_active_capacity",
+            help="Maximum number of accepted (active) WebSocket connections. "
+            "Unset disables the limit.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-max-queue-length",
+            type=int,
+            dest="admission_max_queue_length",
+            help="Maximum number of connections allowed to wait for admission. "
+            "Overflows are rejected immediately.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-max-queue-bytes",
+            type=int,
+            dest="admission_max_queue_bytes",
+            help="Maximum total weight of connections waiting for admission.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-queue-timeout",
+            type=float,
+            dest="admission_queue_timeout",
+            help="Maximum seconds a connection may wait for admission before "
+            "being rejected.",
+            default=None,
+        )
+        self.parser.add_argument(
+            "--admission-websocket-accept-policy",
+            dest="admission_websocket_accept_policy",
+            help="What to do when websocket.accept arrives but the active "
+            "WebSocket capacity is full: reject the handshake or wait.",
+            choices=[POLICY_REJECT, POLICY_WAIT],
+            default=POLICY_REJECT,
+        )
 
         self.server = None
 
@@ -280,6 +336,32 @@ class CommandLineInterface:
             file_descriptor=args.file_descriptor,
         )
         endpoints = sorted(args.socket_strings + endpoints)
+        # Build the optional admission configuration. Only enable the
+        # controller when at least one capacity limit is requested so the
+        # default startup behaviour stays unchanged.
+        admission_config = None
+        if any(
+            (
+                args.admission_http_capacity is not None,
+                args.admission_websocket_pending_capacity is not None,
+                args.admission_websocket_active_capacity is not None,
+            )
+        ):
+            admission_config = AdmissionConfig(
+                http_max_capacity=args.admission_http_capacity,
+                websocket_pending_max_capacity=(
+                    args.admission_websocket_pending_capacity
+                ),
+                websocket_active_max_capacity=(
+                    args.admission_websocket_active_capacity
+                ),
+                max_queue_length=args.admission_max_queue_length,
+                max_queue_bytes=args.admission_max_queue_bytes,
+                queue_timeout=args.admission_queue_timeout,
+                websocket_accept_full_policy=(
+                    args.admission_websocket_accept_policy
+                ),
+            )
         # Start the server
         logger.info("Starting server at {}".format(", ".join(endpoints)))
         self.server = self.server_class(
@@ -305,6 +387,7 @@ class CommandLineInterface:
                 "X-Forwarded-Proto" if args.proxy_headers else None
             ),
             server_name=args.server_name,
+            admission_config=admission_config,
         )
         self.server.run()
         if self.server.abort_start:

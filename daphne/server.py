@@ -37,6 +37,7 @@ from twisted.internet.endpoints import serverFromString
 from twisted.logger import STDLibLogObserver, globalLogBeginner
 from twisted.web import http
 
+from .admission import AdmissionConfig, AdmissionController, KIND_HTTP
 from .http_protocol import HTTPFactory
 from .ws_protocol import WebSocketFactory
 
@@ -67,11 +68,29 @@ class Server:
         application_close_timeout=10,
         ready_callable=None,
         server_name="daphne",
+        admission_config=None,
     ):
         self.application = application
         self.endpoints = endpoints or []
         self.listeners = []
         self.listening_addresses = []
+        # Optional application admission controller. Disabled (None) unless a
+        # configuration with at least one capacity limit is supplied, so the
+        # default server behaviour is unchanged.
+        if admission_config is not None:
+            if not isinstance(admission_config, AdmissionConfig):
+                raise TypeError(
+                    "admission_config must be an AdmissionConfig instance"
+                )
+            self.admission = (
+                AdmissionController(admission_config)
+                if admission_config.enabled
+                else None
+            )
+        else:
+            self.admission = None
+        # protocol -> admission Ticket mapping
+        self._admission_tickets = {}
         self.signal_handlers = signal_handlers
         self.action_logger = action_logger
         self.http_timeout = http_timeout
@@ -92,14 +111,36 @@ class Server:
         self.abort_start = False
         self.ready_callable = ready_callable
         self.server_name = server_name
+        # Serving state. ``start`` flips this on; ``stop_serving`` flips it
+        # off so the periodic checker chains terminate on their next tick.
+        self._serving = False
+        self._ports = []
+        self._application_checker_call = None
+        self._timeout_checker_call = None
         # Check our construction is actually sensible
         if not self.endpoints:
             logger.error("No endpoints. This server will not listen on anything.")
             sys.exit(1)
 
     def run(self):
+        self.start()
+        if not self.abort_start:
+            # Trigger the ready flag if we had one
+            if self.ready_callable:
+                self.ready_callable()
+            # Run the reactor
+            reactor.run(installSignalHandlers=self.signal_handlers)
+
+    def start(self):
+        """
+        Builds factories, schedules the maintenance loops and opens the
+        endpoints, but does not run the reactor. Split out from ``run`` so
+        several Server instances can share one reactor (e.g. in tests).
+        """
+        self._serving = True
         # A dict of protocol: {"application_instance":, "connected":, "disconnected":} dicts
         self.connections = {}
+        self._admission_tickets = {}
         # Make the factory
         self.http_factory = HTTPFactory(self)
         self.ws_factory = WebSocketFactory(self, server=self.server_name)
@@ -127,8 +168,10 @@ class Server:
             )
 
         # Kick off the timeout loop
-        reactor.callLater(1, self.application_checker)
-        reactor.callLater(2, self.timeout_checker)
+        self._application_checker_call = reactor.callLater(
+            1, self.application_checker
+        )
+        self._timeout_checker_call = reactor.callLater(2, self.timeout_checker)
 
         for socket_description in self.endpoints:
             logger.info("Configuring endpoint %s", socket_description)
@@ -147,17 +190,38 @@ class Server:
             asyncio.get_event_loop().set_debug(True)
 
         reactor.addSystemEventTrigger("before", "shutdown", self.kill_all_applications)
-        if not self.abort_start:
-            # Trigger the ready flag if we had one
-            if self.ready_callable:
-                self.ready_callable()
-            # Run the reactor
-            reactor.run(installSignalHandlers=self.signal_handlers)
+
+    def stop_serving(self):
+        """
+        Stops accepting new work and tears down this Server's resources
+        without stopping the shared reactor. Used by the in-process tests;
+        the production shutdown path remains ``kill_all_applications`` via
+        the reactor's before-shutdown trigger.
+        """
+        if not self._serving:
+            return
+        self._serving = False
+        # Admission: reject new queueing and wake every waiting connection.
+        if self.admission is not None:
+            self.admission.close()
+        for port in self._ports:
+            port.stopListening()
+        self._ports = []
+        # Cancel live application work; the final checker ticks release the
+        # remaining admission tickets and remove the connection records.
+        for details in list(self.connections.values()):
+            application_instance = details.get("application_instance")
+            if (
+                application_instance is not None
+                and not application_instance.done()
+            ):
+                application_instance.cancel()
 
     def listen_success(self, port):
         """
         Called when a listen succeeds so we can store port details (if there are any)
         """
+        self._ports.append(port)
         if hasattr(port, "getHost"):
             host = port.getHost()
             if hasattr(host, "host") and hasattr(host, "port"):
@@ -198,6 +262,60 @@ class Server:
         # See https://github.com/django/channels/issues/1181
         if "disconnected" not in self.connections[protocol]:
             self.connections[protocol]["disconnected"] = time.time()
+        # Admission: the network side is gone. For HTTP only the network
+        # share is released here; the task share stays booked until the
+        # application future actually ends. WebSocket tickets are released
+        # wholesale (pending or active), idempotently.
+        ticket = self._admission_tickets.get(protocol)
+        if ticket is not None and self.admission is not None:
+            if ticket.kind == KIND_HTTP:
+                self.admission.release_network(ticket)
+            else:
+                self.admission.release(ticket)
+
+    ### Admission ticket handling
+
+    def attach_admission_ticket(self, protocol, ticket):
+        """
+        Records the admission ticket granted for a protocol so the various
+        terminal paths can release it exactly once.
+        """
+        self._admission_tickets[protocol] = ticket
+
+    def get_admission_ticket(self, protocol):
+        return self._admission_tickets.get(protocol)
+
+    def release_admission_ticket(self, protocol):
+        """
+        Safety-net release used when a protocol object is fully removed.
+        Staged releases earlier on are idempotent, so this only frees
+        shares that are still held.
+        """
+        if self.admission is None:
+            return
+        ticket = self._admission_tickets.pop(protocol, None)
+        if ticket is not None:
+            self.admission.release_all(ticket)
+
+    def admission_metrics(self):
+        """
+        Returns the admission controller's metric snapshot, or None when
+        admission control is disabled. Labels are bounded by design.
+        """
+        if self.admission is None:
+            return None
+        return self.admission.snapshot()
+
+    def admission_deferred(self, coroutine):
+        """
+        Bridges an admission controller coroutine (which awaits asyncio
+        primitives) to a Twisted Deferred running natively on the reactor's
+        asyncio event loop. Cancelling the Deferred cancels the underlying
+        task, so queued waiters never outlive their connection.
+        """
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(coroutine)
+        return defer.Deferred.fromFuture(task)
 
     ### Internal event/message handling
 
@@ -308,20 +426,40 @@ class Server:
                                 protocol.handle_exception(exception)
                 del self.connections[protocol]["application_instance"]
                 application_instance = None
+                # The application task has truly ended: release its task
+                # share now. The network share (if any) was already released
+                # by protocol_disconnected, so the work budget is not freed
+                # early while the task is still alive.
+                ticket = self._admission_tickets.get(protocol)
+                if ticket is not None and self.admission is not None:
+                    if ticket.kind == KIND_HTTP:
+                        self.admission.release_task(ticket)
             # Check to see if protocol is closed and app is closed so we can remove it
             if not application_instance and disconnected:
+                # Safety net: free anything still booked (covers WebSocket
+                # tickets and unusual terminal races). Idempotent.
+                self.release_admission_ticket(protocol)
                 del self.connections[protocol]
-        reactor.callLater(1, self.application_checker)
+        if self._serving:
+            self._application_checker_call = reactor.callLater(
+                1, self.application_checker
+            )
 
     def kill_all_applications(self):
         """
         Kills all application coroutines before reactor exit.
         """
+        # Stop admitting new work and wake every queued waiter with a
+        # shutdown rejection. Already granted tickets are left for the
+        # normal cancel/reap flow below; the existing shutdown sequence is
+        # otherwise unchanged.
+        if self.admission is not None:
+            self.admission.close()
         # Send cancel to all coroutines
         wait_for = []
         for details in self.connections.values():
-            application_instance = details["application_instance"]
-            if not application_instance.done():
+            application_instance = details.get("application_instance")
+            if application_instance is not None and not application_instance.done():
                 application_instance.cancel()
                 wait_for.append(application_instance)
         logger.info("Killed %i pending application instances", len(wait_for))
@@ -337,7 +475,10 @@ class Server:
         """
         for protocol in list(self.connections.keys()):
             protocol.check_timeouts()
-        reactor.callLater(2, self.timeout_checker)
+        if self._serving:
+            self._timeout_checker_call = reactor.callLater(
+                2, self.timeout_checker
+            )
 
     def log_action(self, protocol, action, details):
         """

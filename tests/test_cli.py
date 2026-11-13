@@ -255,9 +255,73 @@ class TestCLIInterface(TestCase):
 
     def test_no_servername(self):
         """
-        Passing `--no-server-name` will set server name to '' (empty string)
+        Passing `--no-server-name` will set the field to '' (empty string)
         """
         self.assertCLI(["--no-server-name"], {"server_name": ""})
+
+    def test_admission_disabled_by_default(self):
+        """
+        No admission flags means no configuration is passed to the server.
+        """
+        self.assertCLI([], {"admission_config": None})
+
+    def test_admission_flags_build_config(self):
+        """
+        Admission flags are translated into a server-side AdmissionConfig.
+        Request data never participates in these server-trusted values.
+        """
+        from daphne.admission import AdmissionConfig
+
+        cli = self.TestedCLI()
+        cli.run(
+            [
+                "--admission-http-capacity",
+                "10",
+                "--admission-websocket-pending-capacity",
+                "4",
+                "--admission-websocket-active-capacity",
+                "8",
+                "--admission-max-queue-length",
+                "3",
+                "--admission-max-queue-bytes",
+                "20",
+                "--admission-queue-timeout",
+                "2.5",
+                "--admission-websocket-accept-policy",
+                "wait",
+                "daphne:__version__",
+            ]
+        )
+        config = cli.server.init_kwargs["admission_config"]
+        self.assertEqual(
+            config,
+            AdmissionConfig(
+                http_max_capacity=10,
+                websocket_pending_max_capacity=4,
+                websocket_active_max_capacity=8,
+                max_queue_length=3,
+                max_queue_bytes=20,
+                queue_timeout=2.5,
+                websocket_accept_full_policy="wait",
+            ),
+        )
+
+    def test_admission_requires_a_capacity(self):
+        """
+        Queue budgets alone do not enable the controller; at least one
+        capacity limit must be configured.
+        """
+        cli = self.TestedCLI()
+        cli.run(
+            [
+                "--admission-max-queue-length",
+                "3",
+                "--admission-queue-timeout",
+                "1",
+                "daphne:__version__",
+            ]
+        )
+        self.assertIsNone(cli.server.init_kwargs["admission_config"])
 
 
 @skipUnless(os.getenv("ASGI_THREADS"), "ASGI_THREADS environment variable not set.")
